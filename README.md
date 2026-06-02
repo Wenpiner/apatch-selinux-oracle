@@ -60,11 +60,12 @@ App 进程 ──写 /proc/self/attr/current──> 内核 LSM(selinux) ──> 
 
 ### Hook 点选择
 
-自 v1.6.0 起按以下优先级选择 hook 符号（三档兜底）：
+自 v1.7.0 起按以下优先级选择 hook 目标（四档兜底）：
 
-1. **`selinux_setprocattr`**（首选）—— SELinux 注册到 `security_hook_list` 上的叶子实现，`security_setprocattr` 通过函数指针调用它，**编译器无法把它内联进调用方**。`value` 已是内核缓冲区（由调用方 `memdup_user()` 拷贝完成），开销最低。
-2. **`proc_pid_attr_write`**（VFS 兜底，v1.6.0 新增）—— `proc_pid_attr_operations.write` 的实现函数，VFS 通过 `file_operations` 函数指针调用它，**物理上不可能被内联到 `vfs_write` / `__vfs_write`**。MIUI / Xiaomi 4.14 等 vendor 构建中 `security_setprocattr` 经常被内联到这里、同时 `selinux_setprocattr` 又没导出符号——这种"前两层全失效"的情况下，本档是唯一能拦下来的点。代价：`buf` 是 `__user` 指针，需要额外一次 `copy_from_user`。
-3. **`security_setprocattr`**（最末位）—— LSM 总入口。一旦被内联挂上去等于没挂，仅在前两个符号都查不到时尝试。
+1. **`selinux_setprocattr`**（kallsyms 首选）—— SELinux 注册到 `security_hook_list` 上的叶子实现，`security_setprocattr` 通过函数指针调用它，**编译器无法把它内联进调用方**。`value` 已是内核缓冲区（由调用方 `memdup_user()` 拷贝完成），开销最低。
+2. **`proc_pid_attr_write`（kallsyms）** —— `proc_pid_attr_operations.write` 的实现函数。VFS 通过 `file_operations` 函数指针调用它，**物理上不可能被内联到 `vfs_write` / `__vfs_write`**。
+3. **`proc_pid_attr_write`（f_op 解引用，v1.7.0 新增，关键兜底）** —— 同一个函数，但地址不依赖 kallsyms：模块 init 时 `filp_open("/proc/1/attr/current", O_RDONLY, 0)` 拿到 `struct file *`，读 `fp->f_op->write`，得到的就是 `proc_pid_attr_write` 的真实入口地址。**专门解决 Xiaomi MIUI 4.14 等 vendor 内核 `kallsyms` 表里不含 static 函数符号的情况**（这种内核上 `selinux_setprocattr`、`proc_pid_attr_write` 全是 static，前两档全部查不到，但 `security_setprocattr` 又被内联了——v1.6.0 在这类设备上完全失效，v1.7.0 就是为它兜底）。代价：`buf` 是 `__user` 指针，需要 `copy_from_user`。
+4. **`security_setprocattr`**（最末位）—— LSM 总入口。一旦被内联挂上去等于没挂；仅在前三档全部失败时尝试。
 
 在 Linux 4.14（本模块的主要目标内核）上，相关签名：
 
@@ -339,12 +340,14 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 ```
 
 - 没有 `installed sym=...` → 模块没加载，去 APatch App 检查 KPM 状态
-- `sym=selinux_setprocattr` → 首选档位生效，最稳。
-- `sym=proc_pid_attr_write` → VFS 兜底（档位 2）生效；dmesg 里同时会有 `selinux_setprocattr missing, using VFS layer proc_pid_attr_write`。**这是绕过 vendor 内核内联问题的兜底路径**，Xiaomi/MIUI 4.14 上常见。
-- `sym=security_setprocattr` → 退到最末位档位 3；dmesg 里会打 `selinux_setprocattr & proc_pid_attr_write missing, falling back to security_setprocattr (may be inlined)`。**如果同时 BLOCK 日志一直不出现**，说明该符号已被内联到 `proc_pid_attr_write` 里，挂在它身上的 hook 永远不会执行——这是已知问题，目前没有更进一步的兜底（理论上还可以 hook `vfs_write`，但成本过高且影响面太大，未实现）。
+- `sym=selinux_setprocattr` → 档位 1 生效，最稳。
+- `sym=proc_pid_attr_write` → 档位 2a 生效，VFS 层符号被 kallsyms 直接命中。
+- `sym=proc_pid_attr_write(fop)` → **档位 2b（v1.7.0 新增）生效**，通过 `/proc/1/attr/current` 的 `f_op->write` 解出真实地址；dmesg 同时打 `resolved proc_pid_attr_write via f_op deref: 0xffff...`。Xiaomi MIUI 4.14 等 kallsyms 不含 static 函数的内核走这里。
+- `sym=security_setprocattr` → 退到档位 3（最末位）；dmesg 里有 `all VFS resolution paths failed, falling back to security_setprocattr (may be inlined and ineffective)`。**如果同时 BLOCK 日志一直不出现**，说明该符号已被内联，挂在它身上的 hook 不会执行——此时 v1.7.0 的 f_op deref 也失败了，进一步排查方向是 `filp_open("/proc/1/attr/current")` 为什么返回错（去 dmesg 找 `open ... f_op deref failed: <errno>`）。
 - `comm=0` → `__get_task_comm` 没解析到，后续日志里 `comm=?`（不影响 PID 和拦截）
-- `no hookable symbol found (selinux_setprocattr/proc_pid_attr_write/security_setprocattr)` → 三个符号都找不到，内核可能极度精简或开了 SELinux 静态裁剪
+- `no hookable target found (kallsyms+fop all exhausted)` → 四档全部失败：三个符号都不在 kallsyms，且 `filp_open` 拿不到 attr/current 的 f_op。极罕见，通常意味着内核被深度裁剪
 - `copy_from_user symbol unresolved, cannot hook proc_pid_attr_write` → 走到 VFS 档位时 `__arch_copy_from_user` / `_copy_from_user` 都找不到（极少见，意味着 arm64 uaccess 符号被隐藏）；模块返回 -3 拒绝加载
+- `open /proc/1/attr/current for f_op deref failed: <errno>` → f_op 兜底路径打开文件失败，常见 `-13`（EACCES，被 SELinux 拒）/ `-2`（ENOENT，procfs 未挂载）；非致命，会继续往下走档位 3
 - `hook_wrap4(...) failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
 
 ### 第 2 步：先看 BLOCK 日志（不需要 debug）

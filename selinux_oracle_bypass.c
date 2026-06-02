@@ -3,16 +3,18 @@
  * selinux_oracle_bypass.c — APatch / KernelPatch Module (KPM)
  *
  * 用途：阻断 Root 检测工具基于 SELinux 侧信道的盲探。
- *   - Hook 点优先级（自 v1.6.0 起三档）：
- *       1) selinux_setprocattr   —— SELinux 注册到 security_hook_list 的叶子
- *          回调，经函数指针调用无法内联，内核态缓冲区（已 memdup_user），代价最低。
- *       2) proc_pid_attr_write   —— proc_pid_attr_operations.write VFS 回调；
- *          VFS 通过 file_operations 函数指针调用它，编译器物理上无法把它内联
- *          进 vfs_write / __vfs_write。**buf 是 __user 指针**，需要 copy_from_user。
- *          这是绕过 "security_setprocattr 被 vendor 内核内联" 场景的最终兜底。
- *       3) security_setprocattr  —— LSM 顶层入口，最不可靠（部分 4.14 vendor
- *          构建会把它内联到 proc_pid_attr_write，挂上去等于没挂）。仅在前两个
- *          符号都查不到时尝试。
+ *   - Hook 点优先级（自 v1.7.0 起四档）：
+ *       1) selinux_setprocattr      —— kallsyms 查 SELinux LSM 叶子回调；经函数
+ *          指针调用无法内联，内核态缓冲区，代价最低。
+ *       2a) proc_pid_attr_write     —— kallsyms 查该 VFS write 回调符号。
+ *       2b) proc_pid_attr_write     —— **不依赖 kallsyms**：filp_open
+ *          "/proc/self/attr/current" 拿到 struct file*，读 f_op->write，即为
+ *          proc_pid_attr_write 真实入口地址。MIUI / Xiaomi 4.14 等 vendor 内核
+ *          kallsyms 表不含 static 函数符号时，**这是唯一可用的解析路径**。
+ *          代价：buf 是 __user 指针，需 copy_from_user。
+ *       3) security_setprocattr     —— LSM 顶层入口，最不可靠（4.14 vendor 构建
+ *          常把它内联到 proc_pid_attr_write，挂上去等于没挂）。仅在前面全部失败
+ *          时尝试。
  *   - 命中黑名单 → skip_origin=1 + ret=-EINVAL，伪装为"内核不认识该域"
  *
  * 配置方式（KPM 加载 args，逗号或分号分隔）：
@@ -72,7 +74,7 @@
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.6.0");
+KPM_VERSION("1.7.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Wenpiner");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
@@ -257,6 +259,58 @@ static int read_config_file(const char *path)
             i++;
     }
     return 0;
+}
+
+/* ===================== proc_pid_attr_write 真实地址解析 =====================
+ *
+ * 背景：部分 vendor 内核（Xiaomi MIUI 4.14 等）的 kallsyms 表里不含 static
+ * 函数符号——`selinux_setprocattr`、`proc_pid_attr_write` 都查不到，能查到
+ * 的 `security_setprocattr` 又被编译器内联了。结果三个 kallsyms 档位全部
+ * 失效，模块加载成功但 hook 永远不触发。
+ *
+ * 解决思路：`proc_pid_attr_write` 的地址本来就被存在 `proc_pid_attr_operations
+ * .write` 函数指针里，VFS 通过它调用本函数。只要在内核态打开 /proc/<pid>/
+ * attr/current 拿到 struct file*，读 f_op->write，就是该函数的入口地址，
+ * **完全绕过 kallsyms 表**。
+ *
+ * 注意事项：
+ *   - 不要用 "/proc/self/attr/current"——在 KPM init 上下文里 current
+ *     是 load_module 内核线程，没有 task→cred 对应的 /proc/self 入口，
+ *     filp_open 会失败。用固定 PID "1"（init 进程）必然存在。
+ *   - filp_open 成功后只读 f_op，不做 read/write，无副作用。
+ *   - 该函数应只在 init 阶段调用一次，不放热路径。
+ */
+static void *resolve_proc_pid_attr_write_via_fop(void)
+{
+    struct file *(*p_filp_open)(const char *, int, umode_t);
+    int (*p_filp_close)(struct file *, void *);
+    struct file *fp;
+    void *addr = 0;
+
+    p_filp_open  = (void *)kallsyms_lookup_name("filp_open");
+    p_filp_close = (void *)kallsyms_lookup_name("filp_close");
+    if (!p_filp_open || !p_filp_close) {
+        pr_warn("[oracle_bypass] filp_open/close unresolved; f_op fallback disabled\n");
+        return 0;
+    }
+
+    fp = p_filp_open("/proc/1/attr/current", O_RDONLY, 0);
+    if (IS_ERR_OR_NULL(fp)) {
+        long e = IS_ERR(fp) ? PTR_ERR(fp) : -ENOENT;
+        pr_warn("[oracle_bypass] open /proc/1/attr/current for f_op deref failed: %ld\n", e);
+        return 0;
+    }
+
+    if (fp->f_op) {
+        addr = (void *)fp->f_op->write;
+        if (!addr)
+            pr_warn("[oracle_bypass] f_op->write is NULL (kernel uses write_iter only?)\n");
+    } else {
+        pr_warn("[oracle_bypass] fp->f_op is NULL, unexpected\n");
+    }
+
+    p_filp_close(fp, NULL);
+    return addr;
 }
 
 /* ===================== args 解析（逗号/分号分隔） ===================== */
@@ -466,16 +520,15 @@ static long selinux_oracle_init(const char *args, const char *event,
     g_nr_kws = 0;
     parse_args(args);
 
-    /* 选择 hook 符号（v1.6.0 三档优先级）：
-     *   1. selinux_setprocattr   —— SELinux 注册到 security_hook_list 上的叶子
-     *      实现，security_setprocattr 通过函数指针调用它，编译器无法把它内联
-     *      进调用方。value 已是内核缓冲区，开销最小，故为首选。
-     *   2. proc_pid_attr_write   —— VFS 经 proc_pid_attr_operations.write 函数
-     *      指针调用，物理上无法被内联。buf 是 __user 指针，需 copy_from_user。
-     *      这是绕过 "security_setprocattr 被 vendor 内核内联导致符号 hook 不
-     *      触发" 的最终兜底。
-     *   3. security_setprocattr  —— LSM 顶层入口，最不可靠（被内联时挂上去等
-     *      于没挂）。仅在前两个符号都不可用时才尝试。
+    /* 选择 hook 符号（v1.7.0 四档优先级）：
+     *   1.  selinux_setprocattr   —— kallsyms 查 SELinux LSM 叶子回调；经函数
+     *       指针调用无法内联，value 已是内核缓冲区，开销最小，故为首选。
+     *   2a. proc_pid_attr_write   —— kallsyms 查 VFS write 回调符号。
+     *   2b. proc_pid_attr_write   —— 同一个函数，但通过 filp_open + f_op
+     *       函数指针解引用拿到地址，**完全绕过 kallsyms**。专门解决 Xiaomi
+     *       MIUI 4.14 等 vendor 内核 kallsyms 表不含 static 函数符号的情况。
+     *   3.  security_setprocattr  —— LSM 顶层入口，最不可靠（被内联时挂上去
+     *       等于没挂）。仅在前三档全部失败时才尝试。
      * before_setprocattr 与 before_proc_pid_attr_write 都是 4 参签名，但语义
      * 不同；g_cb 记录实际挂上的那个，unhook 时配对使用。 */
     g_target = (void *)kallsyms_lookup_name("selinux_setprocattr");
@@ -487,16 +540,26 @@ static long selinux_oracle_init(const char *args, const char *event,
         if (g_target) {
             g_target_sym = "proc_pid_attr_write";
             g_cb = before_proc_pid_attr_write;
-            pr_warn("[oracle_bypass] selinux_setprocattr missing, using VFS layer proc_pid_attr_write\n");
+            pr_warn("[oracle_bypass] selinux_setprocattr missing, using VFS layer proc_pid_attr_write (kallsyms)\n");
         } else {
-            g_target = (void *)kallsyms_lookup_name("security_setprocattr");
+            /* 档位 2b：kallsyms 查不到时通过 /proc/1/attr/current 的 f_op
+             * 函数指针解出 proc_pid_attr_write 真实地址。MIUI 4.14 等内核
+             * 走到这里。 */
+            g_target = resolve_proc_pid_attr_write_via_fop();
             if (g_target) {
-                g_target_sym = "security_setprocattr";
-                g_cb = before_setprocattr;
-                pr_warn("[oracle_bypass] selinux_setprocattr & proc_pid_attr_write missing, falling back to security_setprocattr (may be inlined)\n");
+                g_target_sym = "proc_pid_attr_write(fop)";
+                g_cb = before_proc_pid_attr_write;
+                pr_warn("[oracle_bypass] selinux_setprocattr & proc_pid_attr_write missing in kallsyms, resolved proc_pid_attr_write via f_op deref: %px\n", g_target);
             } else {
-                pr_err("[oracle_bypass] no hookable symbol found (selinux_setprocattr/proc_pid_attr_write/security_setprocattr)\n");
-                return -1;
+                g_target = (void *)kallsyms_lookup_name("security_setprocattr");
+                if (g_target) {
+                    g_target_sym = "security_setprocattr";
+                    g_cb = before_setprocattr;
+                    pr_warn("[oracle_bypass] all VFS resolution paths failed, falling back to security_setprocattr (may be inlined and ineffective)\n");
+                } else {
+                    pr_err("[oracle_bypass] no hookable target found (kallsyms+fop all exhausted)\n");
+                    return -1;
+                }
             }
         }
     }
