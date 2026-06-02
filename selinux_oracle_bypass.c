@@ -12,12 +12,14 @@
  *   "magisk,ksu"                        -> 仅这两个（不含默认）
  *   "config=/data/adb/kpm/xxx.conf"     -> 从文件读取（Install 模式可用）
  *   "default,config=/data/adb/kpm/xxx.conf"
- *   "default,debug"                     -> 同时打开 pass 日志，用于排错
+ *   "default,debug"                     -> 显式打开 pass 日志（默认就开）
+ *   "default,quiet"                     -> 关闭 pass 日志，仅保留 BLOCK 输出
  *
  * 日志策略：
  *   - 命中拦截（BLOCK）：始终打一行，含 PID/TGID/comm/name/value
- *   - 未命中（pass）   ：仅在 debug 开启时打，用于观察哪些标签被放过
- *   debug 可在 args 里直接写 "debug"，或运行时用下方 CTL0 切换。
+ *   - 未命中（pass）   ：默认也打，用于观察哪些标签被放过；如果嫌吵可以关掉
+ *   debug 默认 *打开*。args 里写 "quiet"/"silent"，或运行时
+ *   `apd kpm control selinux_oracle_bypass "debug off"` 可以关闭 pass 日志。
  *
  * 调试：
  *   apd kpm control selinux_oracle_bypass stats        查看调用/拦截计数
@@ -30,8 +32,9 @@
  * 保证模块加载成功后至少具备基础防护能力。
  *
  * 配置文件格式（纯文本）：
- *   - 每行一个关键字（子串匹配）
+ *   - 每行一个关键字（子串匹配，ASCII 大小写不敏感）
  *   - '#' 起始行为注释；空行忽略；行首尾空白自动 trim
+ *   - 因此 "magisk" 一个关键字即可覆盖 "Magisk"、"MAGISK"、"Magisk file" 等变体
  *
  * 查询当前生效列表：
  *   apd kpm control selinux_oracle_bypass list   (然后 dmesg 看输出)
@@ -60,7 +63,7 @@
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.3.0");
+KPM_VERSION("1.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Wenpiner");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
@@ -78,14 +81,15 @@ static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓
 
 /* 调试/诊断
  *   g_debug : 控制 *未命中* 路径是否也打日志。命中（BLOCK）路径总是会打，
- *             因为发生频率极低且对排查最有价值。args 含 "debug"/"verbose"，
- *             或运行时 `apd kpm control selinux_oracle_bypass "debug on"`
- *             可以打开 pass 日志。
+ *             因为发生频率极低且对排查最有价值。
+ *             *默认 1（开）*——便于普通用户/调试者直接看到所有 setprocattr
+ *             流量并按 PID/comm 过滤；args 含 "quiet"/"silent" 或运行时
+ *             `apd kpm control selinux_oracle_bypass "debug off"` 可以关闭。
  *   g_calls : security_setprocattr 进入次数（含未命中）。
  *   g_blocks: 实际被短路（返回 -EINVAL）的次数。
  * 这三个值通过 CTL0 "stats" 也能查询。
  */
-static int           g_debug;
+static int           g_debug = 1;
 static unsigned long g_calls;
 static unsigned long g_blocks;
 
@@ -102,13 +106,22 @@ static const char *const g_defaults[] = {
 
 /* ===================== 字符串小工具（不依赖外部链接） ===================== */
 
+static inline char kp_tolower(char c)
+{
+    return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
+}
+
+/* ASCII 大小写不敏感子串匹配。
+ * 探测器（如 Duck Detector）会用大写首字母的伪 label（"Magisk"、"Magisk file"）
+ * 来探刺 /proc/self/attr/current —— 真实的 SELinux type 全是小写，所以这种
+ * 变形不会与合法策略冲突，case-insensitive 匹配是严格更宽的安全超集。 */
 static int kp_memcontains(const char *hay, size_t hlen, const char *needle)
 {
     size_t nlen = 0, i, j;
     while (needle[nlen]) nlen++;
     if (nlen == 0 || nlen > hlen) return 0;
     for (i = 0; i + nlen <= hlen; i++) {
-        for (j = 0; j < nlen && hay[i + j] == needle[j]; j++) ;
+        for (j = 0; j < nlen && kp_tolower(hay[i + j]) == kp_tolower(needle[j]); j++) ;
         if (j == nlen) return 1;
     }
     return 0;
@@ -250,10 +263,19 @@ static void parse_args(const char *args)
             kw_add_defaults();
             continue;
         }
-        /* token = "debug" / "verbose"：打开每次 hook 命中入口的逐条日志 */
+        /* token = "debug" / "verbose"：显式打开 pass 日志（默认已开，主要用于
+         * 在 "quiet" 之后再恢复，例如 args="quiet,debug" 实测语义不冲突，
+         * 后写的覆盖先写的；解析按 token 顺序生效。） */
         if (((end - start) == 5 && kp_strneq(&args[start], "debug",   5)) ||
             ((end - start) == 7 && kp_strneq(&args[start], "verbose", 7))) {
             g_debug = 1;
+            continue;
+        }
+        /* token = "quiet" / "silent"：关闭 pass 日志（仅保留 BLOCK 日志）。
+         * 由于 g_debug 默认为 1，希望"静音生产环境"时在 args 里加 quiet 即可。 */
+        if (((end - start) == 5 && kp_strneq(&args[start], "quiet",  5)) ||
+            ((end - start) == 6 && kp_strneq(&args[start], "silent", 6))) {
+            g_debug = 0;
             continue;
         }
         /* token = "config=/some/path"

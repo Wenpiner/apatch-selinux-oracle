@@ -176,7 +176,8 @@ magisk,kernelsu,my_custom_root
 |---|---|
 | `default` / `defaults` | 装入内置默认列表 |
 | `config=/some/path.conf` | 从文件加载更多关键字 |
-| `debug` / `verbose` | 同时打开 *未命中* 路径的日志（命中拦截始终会打，无需 debug） |
+| `debug` / `verbose` | 显式打开 *未命中* 路径的日志（**v1.4.0 起默认就开**，此 token 主要用于在 `quiet` 之后再恢复） |
+| `quiet` / `silent` | 关闭 *未命中* 路径的日志，仅保留 BLOCK 输出（生产/低噪音场景） |
 | 其它字面量 | 直接作为关键字添加 |
 
 例：
@@ -189,7 +190,8 @@ magisk,kernelsu,my_custom_root
 | `"default,foo"` | 内置默认 + `foo` |
 | `"config=/data/adb/kpm/x.conf"` | 仅来自 conf |
 | `"default,config=/data/adb/kpm/x.conf"` | 内置默认 + conf 内容 |
-| `"default,debug"` | 内置默认 + 启动即开调试日志 |
+| `"default,debug"` | 内置默认 + 启动即开调试日志（与默认行为等价） |
+| `"default,quiet"` | 内置默认 + 关闭 pass 日志（只看 BLOCK） |
 
 ### C. 配置文件
 
@@ -308,7 +310,7 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 应看到（缺任何一行就说明那一步失败）：
 
 ```
-[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=0 comm=1 event=... args=...
+[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=1 comm=1 event=... args=...
 [oracle_bypass]   [0] magisk
 [oracle_bypass]   [1] kernelsu
 ...
@@ -321,7 +323,7 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 
 ### 第 2 步：先看 BLOCK 日志（不需要 debug）
 
-v1.3.0 起，**命中拦截始终会打日志**，无需打开 debug：
+**命中拦截始终会打日志**，不依赖 debug（v1.3.0 起的策略；v1.4.0 起 debug 默认也已经是开的）：
 
 ```bash
 adb shell su -c 'dmesg -w | grep "oracle_bypass.*BLOCK"'
@@ -344,23 +346,19 @@ adb shell su -c 'dmesg -w | grep "oracle_bypass.*comm=detector_app"'
 adb shell su -c 'dmesg | grep "oracle_bypass.*BLOCK" | sed -E "s/.*value=//" | sort -u'
 ```
 
-### 第 3 步：打开 debug，看探测器 *漏过* 了什么
+### 第 3 步：看 pass 日志，找出探测器 *漏过* 了什么
 
-如果 BLOCK 日志为 0、但探测器仍然报"检测到 Root"，多半是某个新关键字没收录。把 pass 日志也打出来：
+**v1.4.0 起 debug 默认就是开的**，所以 BLOCK 之外的每次 `security_setprocattr` 进入也都会打 `pass` 日志，无需额外开启。如果之前手动关掉了，再开一次：
 
 ```bash
-# 运行时开（推荐，免重启）：
+# 运行时开（如果先前关掉了）：
 adb shell su -c 'apd kpm control selinux_oracle_bypass "debug on"'
 
-# 或加载时就开：args 里加 debug
-#   APatch App → KPM args = "default,debug"
-#   或 load.sh 里改 ARGS="default,debug,config=..."
-
-# 跟随日志（建议加 PID 过滤，避免 zygote 等系统进程刷屏）
+# 跟随日志（建议加 PID/comm 过滤，避免 zygote 等系统进程刷屏）
 adb shell su -c 'dmesg -w | grep "oracle_bypass.*comm=detector_app"'
 ```
 
-debug 打开后每次 `security_setprocattr` 进入都会打：
+每次 `security_setprocattr` 进入都会打：
 
 ```
 [oracle_bypass] BLOCK pid=12345 tgid=12340 comm=detector_app name=current size=13 value="u:r:magisk:s0"
@@ -399,13 +397,19 @@ adb shell su -c 'dmesg | grep "oracle_bypass.*stats" | tail -1'
 - `blocks` 增长 = 确实在拦截
 - 长时间 `calls=0` = hook 没触发，回到第 3 步
 
-### 第 5 步：debug 用完关掉（避免日志风暴）
+### 第 5 步：嫌吵就关掉 pass 日志（debug off）
 
 ```bash
+# 运行时关（保留 BLOCK 日志）：
 adb shell su -c 'apd kpm control selinux_oracle_bypass "debug off"'
+
+# 想加载时就关、避免开机后的日志风暴，在 args 里加 quiet：
+#   APatch App → KPM args = "default,quiet"
+#   或 load.sh 里改 ARGS="default,quiet,config=..."
 ```
 
-> debug 模式下每个 setprocattr 调用都会打日志，普通使用会很吵。生产环境保持 off。
+> v1.4.0 起 debug 默认 ON，便于普通用户/调试者一开机就能看到所有 setprocattr 流量。
+> 生产环境/低噪音场景建议 args 加 `quiet`，或运行时 `debug off`；BLOCK 日志依旧会照常输出。
 
 ---
 
@@ -516,7 +520,7 @@ apatch-selinux-oracle/
 ### ⚠️ 已知限制 / 注意事项
 
 1. **仅覆盖写路径**：探测器若改用 `getprocattr` 之类的读路径做 Oracle（实际很少见，因为 SELinux 读返回的是当前进程自己的 label，没有信息泄漏面），本模块不会拦截。
-2. **关键字静态匹配**：纯子串匹配，不支持正则。如果探测器使用**变形 label**（例如随机大小写、unicode 等价字符），可能漏过——不过 SELinux 解析器本身对大小写敏感，所以这种"变形"探测器自己就会失败，反而帮我们挡住了。
+2. **关键字静态匹配**：纯子串匹配（自 v1.4.0 起对 ASCII **大小写不敏感**），不支持正则、unicode 等价字符。常见的伪 label 变形（例如 Duck Detector 用的 `Magisk` / `Magisk file`）已经覆盖；如果探测器走 unicode 同形字符或乱序拼接，仍可能漏过。
 3. **conf 文件路径必须在 init 阶段就可读**：早期 init 时 `/data` 可能未挂载，建议 conf 放在 `/data/adb/kpm/`，并让 APatch loader 在 `/data` ready 之后再加载本模块（默认行为）。如果使用 Embed 模式（编译进 KP），需要把 conf 内容直接以字面量形式写到 args 里，或接受模块自动降级为内置默认。
 4. **跨内核版本签名变化**：4.20+ 的 `security_setprocattr` 是 3 参数，本模块当前用 `hook_wrap4`，到那种内核上需要改成 `hook_wrap3` 并相应调整 `before_setprocattr` 的取参方式。
 5. **不防"暴力字典"探测器**：如果某个探测器把"业内所有 Root 私有 type"都扫一遍，理论上你需要把这些字符串都加到 conf 里。但实际工程上覆盖 `magisk`/`kernelsu`/`ksu`/`ksud`/`supolicy`/`:su:` 这 6 个已经能挡住目前已知的全部公开实现。
