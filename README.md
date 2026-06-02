@@ -176,6 +176,7 @@ magisk,kernelsu,my_custom_root
 |---|---|
 | `default` / `defaults` | 装入内置默认列表 |
 | `config=/some/path.conf` | 从文件加载更多关键字 |
+| `debug` / `verbose` | 启用 per-call 日志（每次 hook 命中入口都打一行，用于排错） |
 | 其它字面量 | 直接作为关键字添加 |
 
 例：
@@ -188,6 +189,7 @@ magisk,kernelsu,my_custom_root
 | `"default,foo"` | 内置默认 + `foo` |
 | `"config=/data/adb/kpm/x.conf"` | 仅来自 conf |
 | `"default,config=/data/adb/kpm/x.conf"` | 内置默认 + conf 内容 |
+| `"default,debug"` | 内置默认 + 启动即开调试日志 |
 
 ### C. 配置文件
 
@@ -277,6 +279,103 @@ dmesg | grep -E "avc: |type=1400" | tail -20
 ```
 
 成功拦截时，**不应该**出现关于上面那些字符串的拒绝日志（因为我们在 LSM 入口就短路，根本没让 SELinux 跑起来）。
+
+---
+
+## 故障排查：没生效怎么办
+
+> v1.2.0 起内置 **debug 开关** 和 **调用计数器**，绝大多数"看起来没生效"都能在 5 分钟内定位。
+
+### 第 0 步：日志去向
+
+KPM 用 kernel `printk` 输出，**不会自动进入普通 `logcat` 主缓冲**。三个查看入口任选：
+
+| 命令 | 适用 | 备注 |
+|---|---|---|
+| `dmesg \| grep oracle_bypass` | 所有 Android | 最稳，需 root |
+| `dmesg -w \| grep oracle_bypass` | 所有 Android | 实时跟随；调试时单开一个窗口 |
+| `logcat -b kernel \| grep oracle_bypass` | Android 9+ | logd 默认从 `/dev/kmsg` 读 kernel ring buffer 到这个独立 buffer |
+| `cat /proc/kmsg` | 所有 Android | 阻塞读，需 root，会一次性消费 |
+
+> `logcat`（默认 `main` buffer）**看不到** kernel printk。必须加 `-b kernel`。
+
+### 第 1 步：确认模块装上了
+
+```bash
+adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
+```
+
+应看到（缺任何一行就说明那一步失败）：
+
+```
+[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=0 event=... args=...
+[oracle_bypass]   [0] magisk
+[oracle_bypass]   [1] kernelsu
+...
+```
+
+- 没有 `installed @ ...` → 模块没加载，去 APatch App 检查 KPM 状态
+- `kallsyms_lookup_name` 找不到 `security_setprocattr` → `installed` 那行不会出现，但会有 `security_setprocattr not found`
+- `hook_wrap4 failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
+
+### 第 2 步：打开 debug，看探测器实际写了什么
+
+```bash
+# 运行时开（推荐，免重启）：
+adb shell su -c 'apd kpm control selinux_oracle_bypass "debug on"'
+
+# 或加载时就开：args 里加 debug
+#   APatch App → KPM args = "default,debug"
+#   或 load.sh 里改 ARGS="default,debug,config=..."
+
+# 跟随日志
+adb shell su -c 'dmesg -w | grep oracle_bypass'
+```
+
+然后让探测器跑一次。`debug on` 之后每次 `security_setprocattr` 进入都会打：
+
+```
+[oracle_bypass] call name=current size=14 BLOCK value="u:r:magisk:s0"
+[oracle_bypass] call name=current size=12 pass  value="u:r:zygote:s0"
+[oracle_bypass] call name=exec    size=17 pass  value="u:r:untrusted_app"
+```
+
+- `BLOCK` = 命中黑名单，已短路返回 `-EINVAL`
+- `pass` = 未命中，原样放行
+- `value="..."` 里不可打印字节会被替换成 `.`
+
+### 第 3 步：根据 debug 输出对症下药
+
+| 现象 | 结论 | 处理 |
+|---|---|---|
+| `debug on` 之后探测器跑了，**完全没有 `call` 日志** | hook 没在被探测的进程上触发，可能：① 探测器没经过 setprocattr 路径；② 内核版本对应不上 hook 签名 | 用 `apd kpm control selinux_oracle_bypass stats` 看 `calls` 是不是 0；如果是 0，先尝试自己 `echo magisk > /proc/self/attr/current` 看 `calls` 是否增长 |
+| 有 `call` 日志但全是 `pass`，能看到探测器写的字符串 | 字符串不在黑名单里 | 复制 `value="..."` 里的实际内容，加到 `selinux_oracle_bypass.conf` 后 reload |
+| 有 `BLOCK` 日志但探测器仍然报"检测到 Root" | 探测器**不是只用** SELinux Oracle 这一条；或者它在比对错误码以外的额外信号 | 不属于本模块范围，需要看探测器其它检测面 |
+
+### 第 4 步：查看累计统计
+
+```bash
+adb shell su -c 'apd kpm control selinux_oracle_bypass stats'
+adb shell su -c 'dmesg | grep "oracle_bypass.*stats" | tail -1'
+```
+
+输出：
+
+```
+[oracle_bypass] stats calls=12345 blocks=37 debug=1 nr_keywords=9
+```
+
+- `calls` 持续增长 = hook 工作正常
+- `blocks` 增长 = 确实在拦截
+- 长时间 `calls=0` = hook 没触发，回到第 3 步
+
+### 第 5 步：debug 用完关掉（避免日志风暴）
+
+```bash
+adb shell su -c 'apd kpm control selinux_oracle_bypass "debug off"'
+```
+
+> debug 模式下每个 setprocattr 调用都会打日志，普通使用会很吵。生产环境保持 off。
 
 ---
 

@@ -12,6 +12,13 @@
  *   "magisk,ksu"                        -> 仅这两个（不含默认）
  *   "config=/data/adb/kpm/xxx.conf"     -> 从文件读取（Install 模式可用）
  *   "default,config=/data/adb/kpm/xxx.conf"
+ *   "default,debug"                     -> 启用 per-call 日志，用于排错
+ *
+ * 调试：
+ *   apd kpm control selinux_oracle_bypass stats        查看调用/拦截计数
+ *   apd kpm control selinux_oracle_bypass "debug on"   运行时开日志
+ *   apd kpm control selinux_oracle_bypass "debug off"  关闭
+ *   日志去向：dmesg、或 Android 9+ 的 `logcat -b kernel`
  *
  * 失败兜底：无论 args 长什么样，只要解析完毕关键字表仍为空（例如配置文件
  * 路径错误、文件全是注释、Embed 阶段 /data 未挂载等），自动装入内置默认列表，
@@ -47,7 +54,7 @@
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.1.1");
+KPM_VERSION("1.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("anon");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
@@ -62,6 +69,17 @@ static void *g_target;
 static char  g_kws[MAX_KEYWORDS][MAX_KW_LEN + 1];
 static int   g_nr_kws;
 static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓冲 */
+
+/* 调试/诊断
+ *   g_debug : args 含 "debug" 时打开，每次 hook 命中入口都把 name/size/value
+ *             打到 kernel log（dmesg 或 logcat -b kernel）。
+ *   g_calls : security_setprocattr 进入次数（含未命中）。
+ *   g_blocks: 实际被短路（返回 -EINVAL）的次数。
+ * 这三个值通过 CTL0 "stats" 也能查询。
+ */
+static int           g_debug;
+static unsigned long g_calls;
+static unsigned long g_blocks;
 
 static const char *const g_defaults[] = {
     "magisk", "kernelsu", "kernel_su", "ksud", "supolicy",
@@ -219,6 +237,12 @@ static void parse_args(const char *args)
             kw_add_defaults();
             continue;
         }
+        /* token = "debug" / "verbose"：打开每次 hook 命中入口的逐条日志 */
+        if (((end - start) == 5 && kp_strneq(&args[start], "debug",   5)) ||
+            ((end - start) == 7 && kp_strneq(&args[start], "verbose", 7))) {
+            g_debug = 1;
+            continue;
+        }
         /* token = "config=/some/path"
          * 读失败时不要把整个加载流程拖死，只打日志；
          * 最终是否补默认由本函数末尾的兜底逻辑决定。 */
@@ -271,11 +295,30 @@ static void before_setprocattr(hook_fargs4_t *args, void *udata)
     const char *name  = (const char *)args->arg1;
     const char *value = (const char *)args->arg2;
     size_t size       = (size_t)args->arg3;
+    int hit;
 
     if (!name || !value || size == 0) return;
     if (size > SCAN_LIMIT) size = SCAN_LIMIT;
 
-    if (is_blacklisted(value, size)) {
+    g_calls++;
+    hit = is_blacklisted(value, size);
+
+    /* 调试模式：每次进入都打一行日志，便于排查"hook 装上了但没命中"。
+     * 把 value 中的不可打印字节替换为 '.'，避免污染 dmesg 文本格式。 */
+    if (g_debug) {
+        char dbg[SCAN_LIMIT + 1];
+        size_t j;
+        for (j = 0; j < size; j++) {
+            char c = value[j];
+            dbg[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        }
+        dbg[size] = '\0';
+        pr_info("[oracle_bypass] call name=%s size=%zu %s value=\"%s\"\n",
+                name, size, hit ? "BLOCK" : "pass", dbg);
+    }
+
+    if (hit) {
+        g_blocks++;
         args->skip_origin = 1;
         args->ret = -EINVAL;
     }
@@ -305,20 +348,42 @@ static long selinux_oracle_init(const char *args, const char *event,
         return -2;
     }
 
-    pr_info("[oracle_bypass] installed @ %px nr_keywords=%d event=%s args=%s\n",
-            g_target, g_nr_kws, event ? event : "", args ? args : "");
+    pr_info("[oracle_bypass] installed @ %px nr_keywords=%d debug=%d event=%s args=%s\n",
+            g_target, g_nr_kws, g_debug, event ? event : "", args ? args : "");
     for (i = 0; i < g_nr_kws; i++)
         pr_info("[oracle_bypass]   [%d] %s\n", i, g_kws[i]);
     return 0;
 }
 
-/* CTL0：唯一命令是 "list"，把当前关键字列表打到 dmesg。
- * （不回写 out_msg，避免依赖 compat_copy_to_user 的具体可用性） */
+/* CTL0 命令（输出全部走 kernel log，可用 dmesg 或 logcat -b kernel 查看）：
+ *   list           列出当前生效关键字
+ *   stats          打印调用 / 拦截计数 + debug 开关状态
+ *   debug on|off   运行时开 / 关 per-call 日志
+ * 不回写 out_msg，避免依赖 compat_copy_to_user 的具体可用性。 */
 static long selinux_oracle_control0(const char *args, char *__user out_msg, int outlen)
 {
+    const char *cmd = args ? args : "";
     int i;
-    pr_info("[oracle_bypass] ctl0 cmd=%s nr_keywords=%d\n",
-            args ? args : "(null)", g_nr_kws);
+
+    if (kp_strlen(cmd) >= 8 && kp_strneq(cmd, "debug on",  8)) {
+        g_debug = 1;
+        pr_info("[oracle_bypass] debug=1\n");
+        return 0;
+    }
+    if (kp_strlen(cmd) >= 9 && kp_strneq(cmd, "debug off", 9)) {
+        g_debug = 0;
+        pr_info("[oracle_bypass] debug=0\n");
+        return 0;
+    }
+    if (kp_strlen(cmd) == 5 && kp_strneq(cmd, "stats", 5)) {
+        pr_info("[oracle_bypass] stats calls=%lu blocks=%lu debug=%d nr_keywords=%d\n",
+                g_calls, g_blocks, g_debug, g_nr_kws);
+        return 0;
+    }
+
+    /* 默认 / "list"：导出关键字列表 */
+    pr_info("[oracle_bypass] ctl0 cmd=%s nr_keywords=%d calls=%lu blocks=%lu debug=%d\n",
+            cmd[0] ? cmd : "(null)", g_nr_kws, g_calls, g_blocks, g_debug);
     for (i = 0; i < g_nr_kws; i++)
         pr_info("[oracle_bypass]   [%d] %s\n", i, g_kws[i]);
     return 0;
