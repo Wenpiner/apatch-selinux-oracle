@@ -27,18 +27,27 @@
  * 修改配置：编辑 conf -> apd kpm unload + apd kpm load（见 load.sh）
  */
 
-#include <hook.h>
-#include <kpmodule.h>
+/*
+ * 注意 include 顺序：
+ *   1. <compiler.h> 必须排在 <kpmodule.h> 之前。kpmodule.h 内 mod_ctl0call_t
+ *      的 typedef 用到 __user 宏，未定义会导致原型被错误解析为 2 参版本，
+ *      最终 KPM_CTL0 报"incompatible function pointer types"。
+ *   2. 不要直接 #include <linux/types.h>、<linux/fcntl.h>——KernelPatch
+ *      头树里没有它们，编译器会回落到 Android NDK sysroot，与 KP 的
+ *      <ktypes.h> 在 __s64/__u64/__kernel_fd_set 上发生 typedef 重定义。
+ *      所需类型/常量经由 KP 自带的 <linux/fs.h> 传递引入即可。
+ */
 #include <compiler.h>
+#include <kpmodule.h>
+#include <hook.h>
+#include <kallsyms.h>
 #include <linux/printk.h>
-#include <linux/errno.h>
-#include <linux/types.h>
 #include <linux/fs.h>
 #include <linux/err.h>
-#include <linux/fcntl.h>
+#include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.1.0");
+KPM_VERSION("1.1.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("anon");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
