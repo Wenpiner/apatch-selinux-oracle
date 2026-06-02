@@ -273,10 +273,14 @@ static int read_config_file(const char *path)
  * attr/current 拿到 struct file*，读 f_op->write，就是该函数的入口地址，
  * **完全绕过 kallsyms 表**。
  *
- * 注意事项：
- *   - 不要用 "/proc/self/attr/current"——在 KPM init 上下文里 current
- *     是 load_module 内核线程，没有 task→cred 对应的 /proc/self 入口，
- *     filp_open 会失败。用固定 PID "1"（init 进程）必然存在。
+ * 路径选择（v1.7.0 实测修正）：
+ *   - 最初用固定 "/proc/1/attr/current"，但在 hidepid=2 的 procfs 挂载下，
+ *     内核线程访问 init(pid 1) 目录被判定无权 ptrace，**直接返回 ENOENT(-2)**
+ *     伪装成不存在（这是 hidepid=2 的语义，hidepid=1 才返回 EACCES）。
+ *     Redmi 21091116AC / MIUI 4.14 实测即此现象。
+ *   - 改为优先 "/proc/self/attr/current"：/proc/self 永远指向访问者自身，
+ *     hidepid 不会隐藏自己；内核线程也有自己的 attr/current 入口，必然可开。
+ *     再加 "/proc/thread-self/..." 与 "/proc/1/..." 双兜底，逐个尝试。
  *   - filp_open 成功后只读 f_op，不做 read/write，无副作用。
  *   - 该函数应只在 init 阶段调用一次，不放热路径。
  *
@@ -311,11 +315,19 @@ struct oracle_file_view {
 
 static void *resolve_proc_pid_attr_write_via_fop(void)
 {
+    /* 候选路径：self 优先（hidepid 不隐藏自身），thread-self 次之，
+     * 固定 pid 1 最后（hidepid=2 下会 ENOENT，仅作非 hidepid 内核的兜底）。 */
+    static const char *const cand[] = {
+        "/proc/self/attr/current",
+        "/proc/thread-self/attr/current",
+        "/proc/1/attr/current",
+    };
     struct file *(*p_filp_open)(const char *, int, umode_t);
     int (*p_filp_close)(struct file *, void *);
     struct file *fp;
     const struct oracle_file_view *fv;
     void *addr = 0;
+    size_t i;
 
     p_filp_open  = (void *)kallsyms_lookup_name("filp_open");
     p_filp_close = (void *)kallsyms_lookup_name("filp_close");
@@ -324,24 +336,31 @@ static void *resolve_proc_pid_attr_write_via_fop(void)
         return 0;
     }
 
-    fp = p_filp_open("/proc/1/attr/current", O_RDONLY, 0);
-    if (IS_ERR_OR_NULL(fp)) {
-        long e = IS_ERR(fp) ? PTR_ERR(fp) : -ENOENT;
-        pr_warn("[oracle_bypass] open /proc/1/attr/current for f_op deref failed: %ld\n", e);
-        return 0;
+    for (i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
+        fp = p_filp_open(cand[i], O_RDONLY, 0);
+        if (IS_ERR_OR_NULL(fp)) {
+            long e = IS_ERR(fp) ? PTR_ERR(fp) : -ENOENT;
+            pr_warn("[oracle_bypass] open %s for f_op deref failed: %ld\n", cand[i], e);
+            continue;
+        }
+
+        fv = (const struct oracle_file_view *)fp;
+        if (fv->f_op) {
+            addr = fv->f_op->write;
+            if (!addr)
+                pr_warn("[oracle_bypass] %s f_op->write is NULL (write_iter only?)\n", cand[i]);
+        } else {
+            pr_warn("[oracle_bypass] %s fp->f_op is NULL, unexpected\n", cand[i]);
+        }
+        p_filp_close(fp, NULL);
+
+        if (addr) {
+            pr_info("[oracle_bypass] resolved proc_pid_attr_write via %s f_op deref\n", cand[i]);
+            return addr;
+        }
     }
 
-    fv = (const struct oracle_file_view *)fp;
-    if (fv->f_op) {
-        addr = fv->f_op->write;
-        if (!addr)
-            pr_warn("[oracle_bypass] f_op->write is NULL (kernel uses write_iter only?)\n");
-    } else {
-        pr_warn("[oracle_bypass] fp->f_op is NULL, unexpected\n");
-    }
-
-    p_filp_close(fp, NULL);
-    return addr;
+    return 0;
 }
 
 /* ===================== args 解析（逗号/分号分隔） ===================== */
@@ -573,14 +592,14 @@ static long selinux_oracle_init(const char *args, const char *event,
             g_cb = before_proc_pid_attr_write;
             pr_warn("[oracle_bypass] selinux_setprocattr missing, using VFS layer proc_pid_attr_write (kallsyms)\n");
         } else {
-            /* 档位 2b：kallsyms 查不到时通过 /proc/1/attr/current 的 f_op
-             * 函数指针解出 proc_pid_attr_write 真实地址。MIUI 4.14 等内核
-             * 走到这里。 */
+            /* 档位 2b：kallsyms 查不到时通过 /proc/self/attr/current 的 f_op
+             * 函数指针解出 proc_pid_attr_write 真实地址（详见解析函数注释，
+             * 已避开 hidepid=2 的 /proc/1 ENOENT 问题）。MIUI 4.14 走这里。 */
             g_target = resolve_proc_pid_attr_write_via_fop();
             if (g_target) {
                 g_target_sym = "proc_pid_attr_write(fop)";
                 g_cb = before_proc_pid_attr_write;
-                pr_warn("[oracle_bypass] selinux_setprocattr & proc_pid_attr_write missing in kallsyms, resolved proc_pid_attr_write via f_op deref: %px\n", g_target);
+                pr_warn("[oracle_bypass] selinux_setprocattr & proc_pid_attr_write missing in kallsyms, using f_op deref result @ %px\n", g_target);
             } else {
                 g_target = (void *)kallsyms_lookup_name("security_setprocattr");
                 if (g_target) {
