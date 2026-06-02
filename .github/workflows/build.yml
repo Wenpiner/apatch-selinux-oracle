@@ -1,0 +1,111 @@
+name: Build & Release KPM
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      kp_ref:
+        description: 'KernelPatch git ref (branch/tag/commit) to use for headers'
+        required: false
+        default: 'main'
+
+env:
+  NDK_VERSION: r26d
+  KPM_NAME: selinux_oracle_bypass
+
+jobs:
+  build:
+    name: Build KPM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Android NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          add-to-path: false
+          local-cache: true
+
+      - name: Clone KernelPatch (kernel headers only)
+        run: |
+          KP_REF="${{ github.event.inputs.kp_ref || 'main' }}"
+          git clone --depth=1 --branch "${KP_REF}" \
+            https://github.com/bmax121/KernelPatch.git \
+            "${RUNNER_TEMP}/KernelPatch"
+          echo "KP_DIR=${RUNNER_TEMP}/KernelPatch" >> "$GITHUB_ENV"
+
+      - name: Show toolchain version
+        env:
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang" --version
+
+      - name: Build KPM
+        env:
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          make USE_NDK=1 -j"$(nproc)"
+          echo "----- file info -----"
+          ls -la *.kpm
+          file *.kpm
+          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf" \
+            -h "${KPM_NAME}.kpm" | head -20
+
+      - name: Stage release assets
+        id: stage
+        run: |
+          mkdir -p dist
+          cp "${KPM_NAME}.kpm"  dist/
+          cp "${KPM_NAME}.conf" dist/
+          cp load.sh            dist/
+          (cd dist && sha256sum * > SHA256SUMS)
+          echo "----- dist contents -----"
+          ls -la dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.KPM_NAME }}-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.KPM_NAME }}-${{ github.sha }}
+          path: dist/
+
+      - name: Inspect download
+        run: ls -la dist/
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/${{ env.KPM_NAME }}.kpm
+            dist/${{ env.KPM_NAME }}.conf
+            dist/load.sh
+            dist/SHA256SUMS
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-beta') }}
