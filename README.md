@@ -60,14 +60,21 @@ App 进程 ──写 /proc/self/attr/current──> 内核 LSM(selinux) ──> 
 
 ### Hook 点选择
 
-`security_setprocattr` 是 LSM 框架在 `procattr` 写入路径上的**唯一总入口**，所有 SELinux/AppArmor/SMACK hook 都挂在它后面。在这里短路，等价于在 LSM 链路最前端就拒绝请求，**SELinux 根本没机会做任何 type 查表 → 完全没有侧信道泄漏**。
+自 v1.5.0 起按以下优先级选择 hook 符号：
 
-在 Linux 4.14（本模块的主要目标内核）上，函数原型是 **4 参数**：
+1. **`selinux_setprocattr`**（首选）—— SELinux 注册到 `security_hook_list` 上的叶子实现，`security_setprocattr` 通过函数指针调用它，**编译器无法把它内联进调用方**，是目前已知最稳定可拦截的点。MIUI / Xiaomi 4.14 等 vendor 构建中，`security_setprocattr` 经常被内联到 `proc_pid_attr_write`，挂在它身上的 inline-hook 永远不会被执行；这是 v1.5.0 之前观察到"`installed @ ...` 出现但 `echo magisk > /proc/self/attr/current` 不触发回调"的根因。
+2. **`security_setprocattr`**（兜底）—— LSM 总入口。某些精简内核（如启用了 LTO 或裁掉 SELinux 实现的设备）可能没有 `selinux_setprocattr` 这个符号，此时回退到顶层入口。
+
+在 Linux 4.14（本模块的主要目标内核）上，两者签名一致：
 
 ```c
 int security_setprocattr(struct task_struct *p, char *name,
                          void *value, size_t size);
+int selinux_setprocattr(struct task_struct *p, char *name,
+                        void *value, size_t size);
 ```
+
+所以 v1.5.0 共用同一个 `before_setprocattr` 回调，无需根据命中的符号分支处理。
 
 > v4.20+ / GKI 5.10+ 改成 3 参数（`p` 被移除），切换上游内核时需要把 `hook_wrap4` 改成 `hook_wrap3`。
 
@@ -310,16 +317,17 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 应看到（缺任何一行就说明那一步失败）：
 
 ```
-[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=1 comm=1 event=... args=...
+[oracle_bypass] installed sym=selinux_setprocattr @ ffffff80xxxxxxxx nr_keywords=N debug=1 comm=1 event=... args=...
 [oracle_bypass]   [0] magisk
 [oracle_bypass]   [1] kernelsu
 ...
 ```
 
-- 没有 `installed @ ...` → 模块没加载，去 APatch App 检查 KPM 状态
+- 没有 `installed sym=...` → 模块没加载，去 APatch App 检查 KPM 状态
+- `sym=security_setprocattr` 而非 `selinux_setprocattr` → 设备上 `selinux_setprocattr` 没导出，已自动回退；同时 dmesg 里会有 `selinux_setprocattr missing, falling back to security_setprocattr`
 - `comm=0` → `__get_task_comm` 没解析到，后续日志里 `comm=?`（不影响 PID 和拦截）
-- `kallsyms_lookup_name` 找不到 `security_setprocattr` → `installed` 那行不会出现，但会有 `security_setprocattr not found`
-- `hook_wrap4 failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
+- `neither selinux_setprocattr nor security_setprocattr found` → 两个符号都找不到，内核可能极度精简或开了 SELinux 静态裁剪，需要换 hook 点
+- `hook_wrap4(...) failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
 
 ### 第 2 步：先看 BLOCK 日志（不需要 debug）
 

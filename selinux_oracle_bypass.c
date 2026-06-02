@@ -3,7 +3,10 @@
  * selinux_oracle_bypass.c — APatch / KernelPatch Module (KPM)
  *
  * 用途：阻断 Root 检测工具基于 SELinux 侧信道的盲探。
- *   - Hook 点：security_setprocattr（4.14 LSM 顶层入口，4 参数签名）
+ *   - Hook 点：优先 selinux_setprocattr（SELinux LSM 叶子回调，经函数指针调用
+ *             无法被内联），不可解析时回退到 security_setprocattr。
+ *             4.14 两个符号签名一致（task_struct*, name, value, size），共享同一
+ *             before 回调。
  *   - 命中黑名单 → skip_origin=1 + ret=-EINVAL，伪装为"内核不认识该域"
  *
  * 配置方式（KPM 加载 args，逗号或分号分隔）：
@@ -63,7 +66,7 @@
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.4.0");
+KPM_VERSION("1.5.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Wenpiner");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
@@ -75,6 +78,7 @@ KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
 #define CONFIG_PATH_MAX 256
 
 static void *g_target;
+static const char *g_target_sym;          /* 记录实际命中的符号名，便于日志/卸载 */
 static char  g_kws[MAX_KEYWORDS][MAX_KW_LEN + 1];
 static int   g_nr_kws;
 static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓冲 */
@@ -383,10 +387,26 @@ static long selinux_oracle_init(const char *args, const char *event,
     g_nr_kws = 0;
     parse_args(args);
 
-    g_target = (void *)kallsyms_lookup_name("security_setprocattr");
-    if (!g_target) {
-        pr_err("[oracle_bypass] security_setprocattr not found\n");
-        return -1;
+    /* 选择 hook 符号：
+     *   1. selinux_setprocattr —— SELinux 注册到 security_hook_list 上的叶子
+     *      实现，security_setprocattr 通过函数指针调用它，编译器无法把它内联
+     *      进调用方，是 4.14 上最稳定可拦截的点。
+     *   2. security_setprocattr —— 顶层入口。某些 vendor 内核（如部分 MIUI
+     *      4.14 构建）会把它内联到 proc_pid_attr_write，hook 符号地址永远
+     *      不会被执行；只有 selinux_setprocattr 找不到时才退到这里。
+     * 两者 4 参签名一致，before_setprocattr 共享。 */
+    g_target = (void *)kallsyms_lookup_name("selinux_setprocattr");
+    if (g_target) {
+        g_target_sym = "selinux_setprocattr";
+    } else {
+        g_target = (void *)kallsyms_lookup_name("security_setprocattr");
+        if (g_target) {
+            g_target_sym = "security_setprocattr";
+            pr_warn("[oracle_bypass] selinux_setprocattr missing, falling back to security_setprocattr\n");
+        } else {
+            pr_err("[oracle_bypass] neither selinux_setprocattr nor security_setprocattr found\n");
+            return -1;
+        }
     }
 
     /* 进程名解析是 nice-to-have；解析不到也不影响 hook 主功能。 */
@@ -396,13 +416,14 @@ static long selinux_oracle_init(const char *args, const char *event,
 
     err = hook_wrap4(g_target, before_setprocattr, 0, 0);
     if (err != HOOK_NO_ERR) {
-        pr_err("[oracle_bypass] hook_wrap4 failed: %d\n", err);
+        pr_err("[oracle_bypass] hook_wrap4(%s) failed: %d\n", g_target_sym, err);
         g_target = 0;
+        g_target_sym = 0;
         return -2;
     }
 
-    pr_info("[oracle_bypass] installed @ %px nr_keywords=%d debug=%d comm=%d event=%s args=%s\n",
-            g_target, g_nr_kws, g_debug, p_get_task_comm ? 1 : 0,
+    pr_info("[oracle_bypass] installed sym=%s @ %px nr_keywords=%d debug=%d comm=%d event=%s args=%s\n",
+            g_target_sym, g_target, g_nr_kws, g_debug, p_get_task_comm ? 1 : 0,
             event ? event : "", args ? args : "");
     for (i = 0; i < g_nr_kws; i++)
         pr_info("[oracle_bypass]   [%d] %s\n", i, g_kws[i]);
@@ -448,6 +469,7 @@ static long selinux_oracle_exit(void *__user reserved)
     if (g_target) {
         hook_unwrap(g_target, before_setprocattr, 0);
         g_target = 0;
+        g_target_sym = 0;
     }
     pr_info("[oracle_bypass] uninstalled\n");
     return 0;
