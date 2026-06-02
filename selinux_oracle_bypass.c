@@ -279,12 +279,42 @@ static int read_config_file(const char *path)
  *     filp_open 会失败。用固定 PID "1"（init 进程）必然存在。
  *   - filp_open 成功后只读 f_op，不做 read/write，无副作用。
  *   - 该函数应只在 init 阶段调用一次，不放热路径。
+ *
+ * struct 布局说明：KernelPatch 头树里 `<linux/fs.h>` 仅前向声明 `struct file`，
+ * 直接 `fp->f_op` 会编译报 "incomplete type"。为此定义 shadow 视图，按 ARM64
+ * Linux 4.14 的已知布局以纯偏移方式解引用：
+ *   struct file 头部（共 40 字节）：
+ *     +0   union { llist_node; rcu_head } f_u   = 16B (rcu_head 是较大成员)
+ *     +16  struct path f_path                   = 16B（vfsmount* + dentry*）
+ *     +32  struct inode *f_inode                = 8B
+ *     +40  const struct file_operations *f_op   <— 目标字段
+ *   struct file_operations 头部：
+ *     +0   struct module *owner                 = 8B
+ *     +8   loff_t (*llseek)(...)                = 8B
+ *     +16  ssize_t (*read)(...)                 = 8B
+ *     +24  ssize_t (*write)(...)                <— 目标字段
+ * 这套偏移在 4.14 主线 + Android common + MIUI vendor 上一致（未启用
+ * CONFIG_PREEMPT_RT；ARM64 Android 4.14 默认未开）。
  */
+
+/* shadow 视图：与 KP 头中前向声明的 struct file 解耦，纯按偏移读字段。 */
+struct oracle_fops_view {
+    void *owner;       /* +0  struct module *                     */
+    void *llseek;      /* +8                                       */
+    void *read;        /* +16                                      */
+    void *write;       /* +24  ssize_t (*write)(file*, __user*, size_t, loff_t*) */
+};
+struct oracle_file_view {
+    unsigned char _pad0[40];                         /* f_u + f_path + f_inode  */
+    const struct oracle_fops_view *f_op;             /* +40                     */
+};
+
 static void *resolve_proc_pid_attr_write_via_fop(void)
 {
     struct file *(*p_filp_open)(const char *, int, umode_t);
     int (*p_filp_close)(struct file *, void *);
     struct file *fp;
+    const struct oracle_file_view *fv;
     void *addr = 0;
 
     p_filp_open  = (void *)kallsyms_lookup_name("filp_open");
@@ -301,8 +331,9 @@ static void *resolve_proc_pid_attr_write_via_fop(void)
         return 0;
     }
 
-    if (fp->f_op) {
-        addr = (void *)fp->f_op->write;
+    fv = (const struct oracle_file_view *)fp;
+    if (fv->f_op) {
+        addr = fv->f_op->write;
         if (!addr)
             pr_warn("[oracle_bypass] f_op->write is NULL (kernel uses write_iter only?)\n");
     } else {
