@@ -13,7 +13,7 @@ on:
         default: 'main'
 
 env:
-  NDK_VERSION: r26d
+  NDK_VERSION: r27d
   KPM_NAME: selinux_oracle_bypass
 
 jobs:
@@ -30,7 +30,11 @@ jobs:
         with:
           ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: false
-          local-cache: true
+          # local-cache 与 setup-ndk 的 symlink 创建有已知冲突：恢复缓存后
+          # aarch64-linux-androidN-clang 包装脚本里的 $DIR/clang 会指向
+          # 不存在的路径（nttld/setup-ndk#518）。CI 上 NDK 下载只占几十秒，
+          # 关掉缓存换稳定性。
+          local-cache: false
 
       - name: Clone KernelPatch (kernel headers only)
         run: |
@@ -44,7 +48,12 @@ jobs:
         env:
           ANDROID_NDK: ${{ steps.ndk.outputs.ndk-path }}
         run: |
-          "$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-clang" --version
+          BIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "--- bin/clang* ---"
+          ls -la "$BIN"/clang* | head -20
+          echo "--- aarch64 wrappers ---"
+          ls -la "$BIN"/aarch64-linux-android*-clang | head -5
+          "$BIN/aarch64-linux-android31-clang" --version
 
       - name: Build KPM
         env:
