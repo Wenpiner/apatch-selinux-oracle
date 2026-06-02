@@ -60,40 +60,55 @@ App 进程 ──写 /proc/self/attr/current──> 内核 LSM(selinux) ──> 
 
 ### Hook 点选择
 
-自 v1.5.0 起按以下优先级选择 hook 符号：
+自 v1.6.0 起按以下优先级选择 hook 符号（三档兜底）：
 
-1. **`selinux_setprocattr`**（首选）—— SELinux 注册到 `security_hook_list` 上的叶子实现，`security_setprocattr` 通过函数指针调用它，**编译器无法把它内联进调用方**，是目前已知最稳定可拦截的点。MIUI / Xiaomi 4.14 等 vendor 构建中，`security_setprocattr` 经常被内联到 `proc_pid_attr_write`，挂在它身上的 inline-hook 永远不会被执行；这是 v1.5.0 之前观察到"`installed @ ...` 出现但 `echo magisk > /proc/self/attr/current` 不触发回调"的根因。
-2. **`security_setprocattr`**（兜底）—— LSM 总入口。某些精简内核（如启用了 LTO 或裁掉 SELinux 实现的设备）可能没有 `selinux_setprocattr` 这个符号，此时回退到顶层入口。
+1. **`selinux_setprocattr`**（首选）—— SELinux 注册到 `security_hook_list` 上的叶子实现，`security_setprocattr` 通过函数指针调用它，**编译器无法把它内联进调用方**。`value` 已是内核缓冲区（由调用方 `memdup_user()` 拷贝完成），开销最低。
+2. **`proc_pid_attr_write`**（VFS 兜底，v1.6.0 新增）—— `proc_pid_attr_operations.write` 的实现函数，VFS 通过 `file_operations` 函数指针调用它，**物理上不可能被内联到 `vfs_write` / `__vfs_write`**。MIUI / Xiaomi 4.14 等 vendor 构建中 `security_setprocattr` 经常被内联到这里、同时 `selinux_setprocattr` 又没导出符号——这种"前两层全失效"的情况下，本档是唯一能拦下来的点。代价：`buf` 是 `__user` 指针，需要额外一次 `copy_from_user`。
+3. **`security_setprocattr`**（最末位）—— LSM 总入口。一旦被内联挂上去等于没挂，仅在前两个符号都查不到时尝试。
 
-在 Linux 4.14（本模块的主要目标内核）上，两者签名一致：
+在 Linux 4.14（本模块的主要目标内核）上，相关签名：
 
 ```c
+/* LSM 层（档位 1、3） */
 int security_setprocattr(struct task_struct *p, char *name,
                          void *value, size_t size);
 int selinux_setprocattr(struct task_struct *p, char *name,
                         void *value, size_t size);
+
+/* VFS 层（档位 2） */
+ssize_t proc_pid_attr_write(struct file *file, const char __user *buf,
+                            size_t count, loff_t *ppos);
 ```
 
-所以 v1.5.0 共用同一个 `before_setprocattr` 回调，无需根据命中的符号分支处理。
+LSM 两个符号共用同一个 `before_setprocattr` 回调；VFS 档位使用专用的 `before_proc_pid_attr_write`（差异：需要 `__arch_copy_from_user` 把 `buf` 拷到内核栈再扫）。
 
-> v4.20+ / GKI 5.10+ 改成 3 参数（`p` 被移除），切换上游内核时需要把 `hook_wrap4` 改成 `hook_wrap3`。
+> v4.20+ / GKI 5.10+ LSM 层改成 3 参数（`p` 被移除），切换上游内核时需要把 `hook_wrap4` 改成 `hook_wrap3`；VFS 档位签名跨版本基本不变。
 
 ### Hook 动作
 
 ```
-before_setprocattr(args) {
+before_setprocattr(args) {                        // 档位 1 / 3
     if (is_blacklisted(args->value, args->size)) {
         args->skip_origin = 1;     // 不再调用原 LSM 链路
         args->ret = -EINVAL;       // 伪装为"该 SELinux 域不存在"
     }
-    // 未命中 → 什么都不做，原函数正常执行
+}
+
+before_proc_pid_attr_write(args) {                // 档位 2
+    copy_from_user(kbuf, args->buf, min(count, 96));
+    if (is_blacklisted(kbuf, ...)) {
+        args->skip_origin = 1;     // 跳过 memdup_user / find_task / security_setprocattr
+        args->ret = -EINVAL;
+    }
 }
 ```
 
-关键点：
+关键点:
 
 - **before-only**：只挂 `hook_wrap4` 的 before 阶段，命中立即短路，不挂 after。链路最短，对未命中流量的性能损耗近似 0。
-- **不二次拷贝**：`value` 在到达这里之前已被 `proc_pid_attr_write()` 通过 `memdup_user()` 拷贝到内核缓冲区，**直接按字节读即可**，绝对不能再 `copy_from_user`（会触发 KFENCE 报警或更严重）。
+- **缓冲区来源因档位而异**：
+  - 档位 1、3：`value` 已被 `proc_pid_attr_write()` 通过 `memdup_user()` 拷到内核缓冲区，直接按字节读，绝对不能再 `copy_from_user`。
+  - 档位 2：本身就在 `proc_pid_attr_write` 入口处，`buf` 仍是 `__user` 指针，**必须** `__arch_copy_from_user` 拷出来再扫，否则触发 page fault。
 - **扫描上限 96 字节**：合法的 SELinux context 通常 `<48` 字节，96 已经留够余量；扫描更长内容只会浪费 cache。
 - **子串匹配**：不要求精确等于。`u:r:magisk:s0`、`u:r:magisk_file:s0`、`u:object_r:magisk_file:s0` 全部因为包含 `magisk` 子串而被一击命中。
 
@@ -324,9 +339,12 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 ```
 
 - 没有 `installed sym=...` → 模块没加载，去 APatch App 检查 KPM 状态
-- `sym=security_setprocattr` 而非 `selinux_setprocattr` → 设备上 `selinux_setprocattr` 没导出，已自动回退；同时 dmesg 里会有 `selinux_setprocattr missing, falling back to security_setprocattr`
+- `sym=selinux_setprocattr` → 首选档位生效，最稳。
+- `sym=proc_pid_attr_write` → VFS 兜底（档位 2）生效；dmesg 里同时会有 `selinux_setprocattr missing, using VFS layer proc_pid_attr_write`。**这是绕过 vendor 内核内联问题的兜底路径**，Xiaomi/MIUI 4.14 上常见。
+- `sym=security_setprocattr` → 退到最末位档位 3；dmesg 里会打 `selinux_setprocattr & proc_pid_attr_write missing, falling back to security_setprocattr (may be inlined)`。**如果同时 BLOCK 日志一直不出现**，说明该符号已被内联到 `proc_pid_attr_write` 里，挂在它身上的 hook 永远不会执行——这是已知问题，目前没有更进一步的兜底（理论上还可以 hook `vfs_write`，但成本过高且影响面太大，未实现）。
 - `comm=0` → `__get_task_comm` 没解析到，后续日志里 `comm=?`（不影响 PID 和拦截）
-- `neither selinux_setprocattr nor security_setprocattr found` → 两个符号都找不到，内核可能极度精简或开了 SELinux 静态裁剪，需要换 hook 点
+- `no hookable symbol found (selinux_setprocattr/proc_pid_attr_write/security_setprocattr)` → 三个符号都找不到，内核可能极度精简或开了 SELinux 静态裁剪
+- `copy_from_user symbol unresolved, cannot hook proc_pid_attr_write` → 走到 VFS 档位时 `__arch_copy_from_user` / `_copy_from_user` 都找不到（极少见，意味着 arm64 uaccess 符号被隐藏）；模块返回 -3 拒绝加载
 - `hook_wrap4(...) failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
 
 ### 第 2 步：先看 BLOCK 日志（不需要 debug）

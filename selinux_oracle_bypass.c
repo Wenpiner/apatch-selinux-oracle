@@ -3,10 +3,16 @@
  * selinux_oracle_bypass.c — APatch / KernelPatch Module (KPM)
  *
  * 用途：阻断 Root 检测工具基于 SELinux 侧信道的盲探。
- *   - Hook 点：优先 selinux_setprocattr（SELinux LSM 叶子回调，经函数指针调用
- *             无法被内联），不可解析时回退到 security_setprocattr。
- *             4.14 两个符号签名一致（task_struct*, name, value, size），共享同一
- *             before 回调。
+ *   - Hook 点优先级（自 v1.6.0 起三档）：
+ *       1) selinux_setprocattr   —— SELinux 注册到 security_hook_list 的叶子
+ *          回调，经函数指针调用无法内联，内核态缓冲区（已 memdup_user），代价最低。
+ *       2) proc_pid_attr_write   —— proc_pid_attr_operations.write VFS 回调；
+ *          VFS 通过 file_operations 函数指针调用它，编译器物理上无法把它内联
+ *          进 vfs_write / __vfs_write。**buf 是 __user 指针**，需要 copy_from_user。
+ *          这是绕过 "security_setprocattr 被 vendor 内核内联" 场景的最终兜底。
+ *       3) security_setprocattr  —— LSM 顶层入口，最不可靠（部分 4.14 vendor
+ *          构建会把它内联到 proc_pid_attr_write，挂上去等于没挂）。仅在前两个
+ *          符号都查不到时尝试。
  *   - 命中黑名单 → skip_origin=1 + ret=-EINVAL，伪装为"内核不认识该域"
  *
  * 配置方式（KPM 加载 args，逗号或分号分隔）：
@@ -66,7 +72,7 @@
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.5.0");
+KPM_VERSION("1.6.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Wenpiner");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
@@ -79,6 +85,18 @@ KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
 
 static void *g_target;
 static const char *g_target_sym;          /* 记录实际命中的符号名，便于日志/卸载 */
+/* before 回调有两种实现：
+ *   - before_setprocattr             用于 security_setprocattr / selinux_setprocattr
+ *     （buf 是内核地址，直接读）
+ *   - before_proc_pid_attr_write     用于 proc_pid_attr_write
+ *     （buf 是 __user 指针，需要 copy_from_user）
+ * g_cb 记录实际挂上的那个，unhook 时一致即可。 */
+static void (*g_cb)(hook_fargs4_t *, void *);
+
+/* arm64 4.14 用户拷贝：__arch_copy_from_user 是导出符号；_copy_from_user 是
+ * static inline 拿不到。这里两个都查一遍以兼容轻度魔改的内核。 */
+static unsigned long (*p_copy_from_user)(void *to, const void __user *from,
+                                         unsigned long n);
 static char  g_kws[MAX_KEYWORDS][MAX_KW_LEN + 1];
 static int   g_nr_kws;
 static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓冲 */
@@ -376,6 +394,67 @@ static void before_setprocattr(hook_fargs4_t *args, void *udata)
     }
 }
 
+/* proc_pid_attr_write(struct file *file, const char __user *buf,
+ *                     size_t count, loff_t *ppos)
+ *
+ * 用于绕过 "security_setprocattr 被 vendor 内核内联导致符号 hook 不触发" 的
+ * 情况。VFS 通过 proc_pid_attr_operations.write 函数指针调用本函数，**编译器
+ * 无法把函数指针指向的目标内联到调用方**。
+ *
+ * 与 before_setprocattr 的关键差异：
+ *   1. buf 是 __user 指针，必须经 copy_from_user 拷到内核栈，不能直接读，
+ *      否则触发 page fault 甚至 oops。
+ *   2. 没有"name"参数（attr 名隐藏在 file->f_path.dentry->d_name 里）；为了
+ *      避免依赖 struct file/path/dentry/qstr 的具体偏移（不同 vendor 内核
+ *      可能有差异），日志里 name 直接写死 "procattr"，已足够定位事件来源。
+ *   3. 设 ret=-EINVAL 后 proc_pid_attr_write 自身的 memdup_user / find_task 等
+ *      序言通通跳过，对 userspace 与 v1.4.0 / v1.5.0 拦截行为字节级等价。
+ */
+static void before_proc_pid_attr_write(hook_fargs4_t *args, void *udata)
+{
+    const void __user *ubuf = (const void __user *)args->arg1;
+    size_t count            = (size_t)args->arg2;
+    char kbuf[SCAN_LIMIT];
+    size_t to_copy;
+    int hit;
+
+    if (!ubuf || count == 0 || !p_copy_from_user) return;
+
+    to_copy = count > SCAN_LIMIT ? SCAN_LIMIT : count;
+    if (p_copy_from_user(kbuf, ubuf, to_copy)) return;
+
+    g_calls++;
+    hit = is_blacklisted(kbuf, to_copy);
+
+    if (hit || g_debug) {
+        char dbg[SCAN_LIMIT + 1];
+        char comm[COMM_LEN] = "?";
+        struct task_ext *te = get_current_task_ext();
+        pid_t pid  = task_ext_valid(te) ? te->pid  : -1;
+        pid_t tgid = task_ext_valid(te) ? te->tgid : -1;
+        size_t j;
+
+        if (p_get_task_comm)
+            p_get_task_comm(comm, sizeof(comm), (void *)current);
+
+        for (j = 0; j < to_copy; j++) {
+            char c = kbuf[j];
+            dbg[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
+        }
+        dbg[to_copy] = '\0';
+
+        pr_info("[oracle_bypass] %s pid=%d tgid=%d comm=%s name=procattr size=%zu value=\"%s\"\n",
+                hit ? "BLOCK" : "pass ",
+                pid, tgid, comm, to_copy, dbg);
+    }
+
+    if (hit) {
+        g_blocks++;
+        args->skip_origin = 1;
+        args->ret = -EINVAL;
+    }
+}
+
 /* ===================== 模块生命周期 ===================== */
 
 static long selinux_oracle_init(const char *args, const char *event,
@@ -387,25 +466,38 @@ static long selinux_oracle_init(const char *args, const char *event,
     g_nr_kws = 0;
     parse_args(args);
 
-    /* 选择 hook 符号：
-     *   1. selinux_setprocattr —— SELinux 注册到 security_hook_list 上的叶子
+    /* 选择 hook 符号（v1.6.0 三档优先级）：
+     *   1. selinux_setprocattr   —— SELinux 注册到 security_hook_list 上的叶子
      *      实现，security_setprocattr 通过函数指针调用它，编译器无法把它内联
-     *      进调用方，是 4.14 上最稳定可拦截的点。
-     *   2. security_setprocattr —— 顶层入口。某些 vendor 内核（如部分 MIUI
-     *      4.14 构建）会把它内联到 proc_pid_attr_write，hook 符号地址永远
-     *      不会被执行；只有 selinux_setprocattr 找不到时才退到这里。
-     * 两者 4 参签名一致，before_setprocattr 共享。 */
+     *      进调用方。value 已是内核缓冲区，开销最小，故为首选。
+     *   2. proc_pid_attr_write   —— VFS 经 proc_pid_attr_operations.write 函数
+     *      指针调用，物理上无法被内联。buf 是 __user 指针，需 copy_from_user。
+     *      这是绕过 "security_setprocattr 被 vendor 内核内联导致符号 hook 不
+     *      触发" 的最终兜底。
+     *   3. security_setprocattr  —— LSM 顶层入口，最不可靠（被内联时挂上去等
+     *      于没挂）。仅在前两个符号都不可用时才尝试。
+     * before_setprocattr 与 before_proc_pid_attr_write 都是 4 参签名，但语义
+     * 不同；g_cb 记录实际挂上的那个，unhook 时配对使用。 */
     g_target = (void *)kallsyms_lookup_name("selinux_setprocattr");
     if (g_target) {
         g_target_sym = "selinux_setprocattr";
+        g_cb = before_setprocattr;
     } else {
-        g_target = (void *)kallsyms_lookup_name("security_setprocattr");
+        g_target = (void *)kallsyms_lookup_name("proc_pid_attr_write");
         if (g_target) {
-            g_target_sym = "security_setprocattr";
-            pr_warn("[oracle_bypass] selinux_setprocattr missing, falling back to security_setprocattr\n");
+            g_target_sym = "proc_pid_attr_write";
+            g_cb = before_proc_pid_attr_write;
+            pr_warn("[oracle_bypass] selinux_setprocattr missing, using VFS layer proc_pid_attr_write\n");
         } else {
-            pr_err("[oracle_bypass] neither selinux_setprocattr nor security_setprocattr found\n");
-            return -1;
+            g_target = (void *)kallsyms_lookup_name("security_setprocattr");
+            if (g_target) {
+                g_target_sym = "security_setprocattr";
+                g_cb = before_setprocattr;
+                pr_warn("[oracle_bypass] selinux_setprocattr & proc_pid_attr_write missing, falling back to security_setprocattr (may be inlined)\n");
+            } else {
+                pr_err("[oracle_bypass] no hookable symbol found (selinux_setprocattr/proc_pid_attr_write/security_setprocattr)\n");
+                return -1;
+            }
         }
     }
 
@@ -414,11 +506,27 @@ static long selinux_oracle_init(const char *args, const char *event,
     if (!p_get_task_comm)
         pr_warn("[oracle_bypass] __get_task_comm unresolved, comm will be '?'\n");
 
-    err = hook_wrap4(g_target, before_setprocattr, 0, 0);
+    /* 用户拷贝符号：仅在 hook proc_pid_attr_write 时需要。arm64 4.14 导出的是
+     * __arch_copy_from_user；同时尝试 _copy_from_user 兼容个别魔改内核。 */
+    if (g_cb == before_proc_pid_attr_write) {
+        p_copy_from_user = (void *)kallsyms_lookup_name("__arch_copy_from_user");
+        if (!p_copy_from_user)
+            p_copy_from_user = (void *)kallsyms_lookup_name("_copy_from_user");
+        if (!p_copy_from_user) {
+            pr_err("[oracle_bypass] copy_from_user symbol unresolved, cannot hook proc_pid_attr_write\n");
+            g_target = 0;
+            g_target_sym = 0;
+            g_cb = 0;
+            return -3;
+        }
+    }
+
+    err = hook_wrap4(g_target, g_cb, 0, 0);
     if (err != HOOK_NO_ERR) {
         pr_err("[oracle_bypass] hook_wrap4(%s) failed: %d\n", g_target_sym, err);
         g_target = 0;
         g_target_sym = 0;
+        g_cb = 0;
         return -2;
     }
 
@@ -466,10 +574,11 @@ static long selinux_oracle_control0(const char *args, char *__user out_msg, int 
 
 static long selinux_oracle_exit(void *__user reserved)
 {
-    if (g_target) {
-        hook_unwrap(g_target, before_setprocattr, 0);
+    if (g_target && g_cb) {
+        hook_unwrap(g_target, g_cb, 0);
         g_target = 0;
         g_target_sym = 0;
+        g_cb = 0;
     }
     pr_info("[oracle_bypass] uninstalled\n");
     return 0;
