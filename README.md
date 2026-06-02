@@ -176,7 +176,7 @@ magisk,kernelsu,my_custom_root
 |---|---|
 | `default` / `defaults` | 装入内置默认列表 |
 | `config=/some/path.conf` | 从文件加载更多关键字 |
-| `debug` / `verbose` | 启用 per-call 日志（每次 hook 命中入口都打一行，用于排错） |
+| `debug` / `verbose` | 同时打开 *未命中* 路径的日志（命中拦截始终会打，无需 debug） |
 | 其它字面量 | 直接作为关键字添加 |
 
 例：
@@ -308,17 +308,45 @@ adb shell su -c 'dmesg | grep oracle_bypass | tail -20'
 应看到（缺任何一行就说明那一步失败）：
 
 ```
-[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=0 event=... args=...
+[oracle_bypass] installed @ ffffff80xxxxxxxx nr_keywords=N debug=0 comm=1 event=... args=...
 [oracle_bypass]   [0] magisk
 [oracle_bypass]   [1] kernelsu
 ...
 ```
 
 - 没有 `installed @ ...` → 模块没加载，去 APatch App 检查 KPM 状态
+- `comm=0` → `__get_task_comm` 没解析到，后续日志里 `comm=?`（不影响 PID 和拦截）
 - `kallsyms_lookup_name` 找不到 `security_setprocattr` → `installed` 那行不会出现，但会有 `security_setprocattr not found`
 - `hook_wrap4 failed: X` → KP inline-hook 失败，看 X 错误码（`HOOK_BAD_ADDRESS=4095` / `HOOK_DUPLICATED=4094` / `HOOK_NO_MEM=4093` / `HOOK_BAD_RELO=4092`）
 
-### 第 2 步：打开 debug，看探测器实际写了什么
+### 第 2 步：先看 BLOCK 日志（不需要 debug）
+
+v1.3.0 起，**命中拦截始终会打日志**，无需打开 debug：
+
+```bash
+adb shell su -c 'dmesg -w | grep "oracle_bypass.*BLOCK"'
+```
+
+让探测器跑一次，看到：
+
+```
+[oracle_bypass] BLOCK pid=12345 tgid=12340 comm=detector_app name=current size=13 value="u:r:magisk:s0"
+```
+
+每条日志包含 **PID（线程 ID）/ TGID（进程 ID）/ comm（进程名）**，可以按需 grep：
+
+```bash
+# 只看某个 PID 的日志
+adb shell su -c 'dmesg -w | grep "oracle_bypass.*pid=12345"'
+# 只看某个进程名的日志
+adb shell su -c 'dmesg -w | grep "oracle_bypass.*comm=detector_app"'
+# 一段时间内拦下了哪些不同字符串
+adb shell su -c 'dmesg | grep "oracle_bypass.*BLOCK" | sed -E "s/.*value=//" | sort -u'
+```
+
+### 第 3 步：打开 debug，看探测器 *漏过* 了什么
+
+如果 BLOCK 日志为 0、但探测器仍然报"检测到 Root"，多半是某个新关键字没收录。把 pass 日志也打出来：
 
 ```bash
 # 运行时开（推荐，免重启）：
@@ -328,29 +356,31 @@ adb shell su -c 'apd kpm control selinux_oracle_bypass "debug on"'
 #   APatch App → KPM args = "default,debug"
 #   或 load.sh 里改 ARGS="default,debug,config=..."
 
-# 跟随日志
-adb shell su -c 'dmesg -w | grep oracle_bypass'
+# 跟随日志（建议加 PID 过滤，避免 zygote 等系统进程刷屏）
+adb shell su -c 'dmesg -w | grep "oracle_bypass.*comm=detector_app"'
 ```
 
-然后让探测器跑一次。`debug on` 之后每次 `security_setprocattr` 进入都会打：
+debug 打开后每次 `security_setprocattr` 进入都会打：
 
 ```
-[oracle_bypass] call name=current size=14 BLOCK value="u:r:magisk:s0"
-[oracle_bypass] call name=current size=12 pass  value="u:r:zygote:s0"
-[oracle_bypass] call name=exec    size=17 pass  value="u:r:untrusted_app"
+[oracle_bypass] BLOCK pid=12345 tgid=12340 comm=detector_app name=current size=13 value="u:r:magisk:s0"
+[oracle_bypass] pass  pid=12345 tgid=12340 comm=detector_app name=current size=12 value="u:r:zygote:s0"
+[oracle_bypass] pass  pid=12345 tgid=12340 comm=detector_app name=exec    size=17 value="u:r:untrusted_app"
 ```
 
 - `BLOCK` = 命中黑名单，已短路返回 `-EINVAL`
-- `pass` = 未命中，原样放行
+- `pass ` = 未命中，原样放行（注意尾随空格用于列对齐）
 - `value="..."` 里不可打印字节会被替换成 `.`
+- `comm=?` 说明 `__get_task_comm` 没解析到，靠 PID 也能定位
 
-### 第 3 步：根据 debug 输出对症下药
+### 第 4 步：根据日志对症下药
 
 | 现象 | 结论 | 处理 |
 |---|---|---|
-| `debug on` 之后探测器跑了，**完全没有 `call` 日志** | hook 没在被探测的进程上触发，可能：① 探测器没经过 setprocattr 路径；② 内核版本对应不上 hook 签名 | 用 `apd kpm control selinux_oracle_bypass stats` 看 `calls` 是不是 0；如果是 0，先尝试自己 `echo magisk > /proc/self/attr/current` 看 `calls` 是否增长 |
-| 有 `call` 日志但全是 `pass`，能看到探测器写的字符串 | 字符串不在黑名单里 | 复制 `value="..."` 里的实际内容，加到 `selinux_oracle_bypass.conf` 后 reload |
+| `debug on` 之后探测器跑了，**完全没有日志** | hook 没在被探测的进程上触发，可能：① 探测器没经过 setprocattr 路径；② 内核版本对应不上 hook 签名 | 用 `apd kpm control selinux_oracle_bypass stats` 看 `calls` 是不是 0；如果是 0，先尝试自己 `echo magisk > /proc/self/attr/current` 看 `calls` 是否增长 |
+| 有 `pass` 日志，能看到探测器写的字符串 | 字符串不在黑名单里 | 复制 `value="..."` 里的实际内容，加到 `selinux_oracle_bypass.conf` 后 reload |
 | 有 `BLOCK` 日志但探测器仍然报"检测到 Root" | 探测器**不是只用** SELinux Oracle 这一条；或者它在比对错误码以外的额外信号 | 不属于本模块范围，需要看探测器其它检测面 |
+| 多个 PID 都在写同一个字符串，但只想关注某个 app | 用 `grep "pid=<TID>"` 或 `grep "comm=<进程名>"` 过滤 | `cat /proc/<tgid>/cmdline` 可以反查 app 包名 |
 
 ### 第 4 步：查看累计统计
 

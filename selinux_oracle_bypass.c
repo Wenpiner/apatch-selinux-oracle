@@ -12,11 +12,16 @@
  *   "magisk,ksu"                        -> 仅这两个（不含默认）
  *   "config=/data/adb/kpm/xxx.conf"     -> 从文件读取（Install 模式可用）
  *   "default,config=/data/adb/kpm/xxx.conf"
- *   "default,debug"                     -> 启用 per-call 日志，用于排错
+ *   "default,debug"                     -> 同时打开 pass 日志，用于排错
+ *
+ * 日志策略：
+ *   - 命中拦截（BLOCK）：始终打一行，含 PID/TGID/comm/name/value
+ *   - 未命中（pass）   ：仅在 debug 开启时打，用于观察哪些标签被放过
+ *   debug 可在 args 里直接写 "debug"，或运行时用下方 CTL0 切换。
  *
  * 调试：
  *   apd kpm control selinux_oracle_bypass stats        查看调用/拦截计数
- *   apd kpm control selinux_oracle_bypass "debug on"   运行时开日志
+ *   apd kpm control selinux_oracle_bypass "debug on"   运行时开 pass 日志
  *   apd kpm control selinux_oracle_bypass "debug off"  关闭
  *   日志去向：dmesg、或 Android 9+ 的 `logcat -b kernel`
  *
@@ -48,15 +53,16 @@
 #include <kpmodule.h>
 #include <hook.h>
 #include <kallsyms.h>
+#include <taskext.h>
 #include <linux/printk.h>
 #include <linux/fs.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 
 KPM_NAME("selinux_oracle_bypass");
-KPM_VERSION("1.2.0");
+KPM_VERSION("1.3.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("anon");
+KPM_AUTHOR("Wenpiner");
 KPM_DESCRIPTION("Block SELinux side-channel probes; keywords configurable");
 
 #define SCAN_LIMIT      96
@@ -71,8 +77,10 @@ static int   g_nr_kws;
 static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓冲 */
 
 /* 调试/诊断
- *   g_debug : args 含 "debug" 时打开，每次 hook 命中入口都把 name/size/value
- *             打到 kernel log（dmesg 或 logcat -b kernel）。
+ *   g_debug : 控制 *未命中* 路径是否也打日志。命中（BLOCK）路径总是会打，
+ *             因为发生频率极低且对排查最有价值。args 含 "debug"/"verbose"，
+ *             或运行时 `apd kpm control selinux_oracle_bypass "debug on"`
+ *             可以打开 pass 日志。
  *   g_calls : security_setprocattr 进入次数（含未命中）。
  *   g_blocks: 实际被短路（返回 -EINVAL）的次数。
  * 这三个值通过 CTL0 "stats" 也能查询。
@@ -80,6 +88,11 @@ static char  g_config_buf[CONFIG_BUF_SZ];   /* 仅 init 期使用的一次性缓
 static int           g_debug;
 static unsigned long g_calls;
 static unsigned long g_blocks;
+
+/* 进程名解析：__get_task_comm 在 4.14/Android 内核普遍可解析，
+ * 解析失败时 comm 字段降级为 "?"，PID/TGID 不受影响。 */
+#define COMM_LEN 16
+static char *(*p_get_task_comm)(char *to, unsigned long len, void *tsk);
 
 static const char *const g_defaults[] = {
     "magisk", "kernelsu", "kernel_su", "ksud", "supolicy",
@@ -303,18 +316,31 @@ static void before_setprocattr(hook_fargs4_t *args, void *udata)
     g_calls++;
     hit = is_blacklisted(value, size);
 
-    /* 调试模式：每次进入都打一行日志，便于排查"hook 装上了但没命中"。
+    /* 命中（BLOCK）始终打日志；未命中（pass）仅在 debug 模式下打。
+     * 这样默认情况下 dmesg 不会被淹没，又能让人立刻看见所有拦截事件；
+     * 排查"该拦的没拦"时打开 debug，能看到 app 实际写了什么字符串、
+     * 来自哪个 PID，从而决定是否扩充黑名单。
      * 把 value 中的不可打印字节替换为 '.'，避免污染 dmesg 文本格式。 */
-    if (g_debug) {
+    if (hit || g_debug) {
         char dbg[SCAN_LIMIT + 1];
+        char comm[COMM_LEN] = "?";
+        struct task_ext *te = get_current_task_ext();
+        pid_t pid  = task_ext_valid(te) ? te->pid  : -1;
+        pid_t tgid = task_ext_valid(te) ? te->tgid : -1;
         size_t j;
+
+        if (p_get_task_comm)
+            p_get_task_comm(comm, sizeof(comm), (void *)current);
+
         for (j = 0; j < size; j++) {
             char c = value[j];
             dbg[j] = (c >= 0x20 && c < 0x7f) ? c : '.';
         }
         dbg[size] = '\0';
-        pr_info("[oracle_bypass] call name=%s size=%zu %s value=\"%s\"\n",
-                name, size, hit ? "BLOCK" : "pass", dbg);
+
+        pr_info("[oracle_bypass] %s pid=%d tgid=%d comm=%s name=%s size=%zu value=\"%s\"\n",
+                hit ? "BLOCK" : "pass ",
+                pid, tgid, comm, name, size, dbg);
     }
 
     if (hit) {
@@ -341,6 +367,11 @@ static long selinux_oracle_init(const char *args, const char *event,
         return -1;
     }
 
+    /* 进程名解析是 nice-to-have；解析不到也不影响 hook 主功能。 */
+    p_get_task_comm = (void *)kallsyms_lookup_name("__get_task_comm");
+    if (!p_get_task_comm)
+        pr_warn("[oracle_bypass] __get_task_comm unresolved, comm will be '?'\n");
+
     err = hook_wrap4(g_target, before_setprocattr, 0, 0);
     if (err != HOOK_NO_ERR) {
         pr_err("[oracle_bypass] hook_wrap4 failed: %d\n", err);
@@ -348,8 +379,9 @@ static long selinux_oracle_init(const char *args, const char *event,
         return -2;
     }
 
-    pr_info("[oracle_bypass] installed @ %px nr_keywords=%d debug=%d event=%s args=%s\n",
-            g_target, g_nr_kws, g_debug, event ? event : "", args ? args : "");
+    pr_info("[oracle_bypass] installed @ %px nr_keywords=%d debug=%d comm=%d event=%s args=%s\n",
+            g_target, g_nr_kws, g_debug, p_get_task_comm ? 1 : 0,
+            event ? event : "", args ? args : "");
     for (i = 0; i < g_nr_kws; i++)
         pr_info("[oracle_bypass]   [%d] %s\n", i, g_kws[i]);
     return 0;
